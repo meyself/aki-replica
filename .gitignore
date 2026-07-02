@@ -1,0 +1,20 @@
+﻿# MIMIC-IV data — never commit this
+data/
+*.csv
+*.csv.gz
+*.parquet
+
+# Model checkpoints (large files)
+models/*.pt
+models/*.pkl
+embeddings/*.pkl
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# Antigravity internals
+.antigravity/
+*.log
