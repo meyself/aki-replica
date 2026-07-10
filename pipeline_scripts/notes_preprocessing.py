@@ -3,7 +3,7 @@ from transformers import AutoTokenizer
 
 def get_tokenizer():
     try:
-        return AutoTokenizer.from_pretrained("microsoft/BiomedNLP-PubMedBERT-base-uncased"), True
+        return AutoTokenizer.from_pretrained("microsoft/BiomedNLP-BiomedBERT-base-uncased-abstract-fulltext"), True
     except Exception as e:
         print(f"Could not load tokenizer: {e}. Using fallback whitespace tokenizer.")
         return None, False
