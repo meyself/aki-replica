@@ -15,3 +15,5 @@ output/
 mimic-code/
 embeddings/
 models/
+
+output/*.csv
