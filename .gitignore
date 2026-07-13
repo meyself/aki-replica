@@ -24,3 +24,4 @@ models/
 embeddings/
 *.pkl
 *.pt
+!results/*.csv
