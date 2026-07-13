@@ -1,261 +1,434 @@
-import pandas as pd
-import numpy as np
+"""
+train_fusion.py — Multimodal Fusion Model for AKI Prediction
+
+Optimized for speed:
+  - Fusion model is tiny (832→256→64→2, ~220K params) — trains in minutes
+  - All embeddings pre-loaded to GPU as tensors before training
+  - batch_size=512 (safe for any GPU, fusion model uses far less VRAM than BERT)
+  - Early stopping with patience=10 on validation loss
+  - SHAP runs on small random sample (500 patients) for speed
+
+Requires:
+  - embeddings/lstm_hidden_states.pkl       (IS_MOCK_BERT irrelevant)
+  - embeddings/biomedbert_cls_embeddings.pkl (must have IS_MOCK_BERT=False)
+  - output/train_cohort.csv
+  - output/test_cohort.csv
+  - models/lr_model.pkl, xgb_model.pkl, lstm_model.pt (for comparison table)
+"""
+
 import os
 import pickle
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, precision_score, recall_score, roc_auc_score, average_precision_score
-from statsmodels.stats.contingency_tables import mcnemar
-import shap
-from sklearn.linear_model import LogisticRegression
-from xgboost import XGBClassifier
+import torch.utils.data as tdata
+from sklearn.metrics import (accuracy_score, precision_score, recall_score,
+                             roc_auc_score, average_precision_score,
+                             confusion_matrix)
+from scipy.stats import chi2_contingency
+import warnings
+warnings.filterwarnings('ignore')
 
-# MANDATORY FIRST STEP — IS_MOCK_BERT Check
+os.makedirs('../models',     exist_ok=True)
+os.makedirs('../embeddings', exist_ok=True)
+os.makedirs('../output',     exist_ok=True)
+
+# ── Device ───────────────────────────────────────────────────────────────────
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if torch.cuda.is_available():
+    print(f"  GPU: {torch.cuda.get_device_name(0)}")
+
+# ── IS_MOCK_BERT guard ────────────────────────────────────────────────────────
+print("\nChecking embedding files...")
 with open('../embeddings/biomedbert_cls_embeddings.pkl', 'rb') as f:
-    bert_emb_data = pickle.load(f)
+    bert_data = pickle.load(f)
 
-if bert_emb_data.get('IS_MOCK_BERT', False):
-    print("WARNING: Running fusion on MOCK BioMedBERT embeddings.")
-    print("Fusion metrics are structurally verified but numerically meaningless.")
-    print("Before presenting results, regenerate real embeddings by running")
-    print("train_unimodal.py on a machine with HuggingFace internet access.\n")
+if bert_data['IS_MOCK_BERT']:
+    print("WARNING: IS_MOCK_BERT=True — fusion will run but results are")
+    print("         not meaningful for the notes modality.")
+    print("         Fix BioMedBERT class weights and rerun train_unimodal.py")
+    print("         then rerun this script for real fusion results.")
+    print("         Proceeding anyway for structural verification...")
+else:
+    print("  IS_MOCK_BERT: False — real BioMedBERT embeddings confirmed ✓")
 
-# Dummy Data matching train_unimodal.py
-train_subjects = [99901, 99902]
-test_subjects = [99903, 99904]
-y_train = np.array([0, 1])
-y_test = np.array([0, 1])
-y_tr_t = torch.LongTensor(y_train)
-y_te_t = torch.LongTensor(y_test)
+# ── Load cohort labels ────────────────────────────────────────────────────────
+print("\nLoading cohort data...")
+train_df = pd.read_csv('../output/train_cohort.csv',
+                       usecols=['subject_id', 'aki_target'])
+test_df  = pd.read_csv('../output/test_cohort.csv',
+                       usecols=['subject_id', 'aki_target'])
 
+train_subjects = train_df['subject_id'].tolist()
+test_subjects  = test_df['subject_id'].tolist()
+y_train        = train_df['aki_target'].values.astype(int)
+y_test         = test_df['aki_target'].values.astype(int)
+
+print(f"  Train: {len(train_subjects):,} patients")
+print(f"  Test:  {len(test_subjects):,} patients")
+
+# ── Load embeddings ───────────────────────────────────────────────────────────
+print("\nLoading LSTM embeddings...")
 with open('../embeddings/lstm_hidden_states.pkl', 'rb') as f:
-    lstm_emb = pickle.load(f)
+    lstm_data = pickle.load(f)
 
-bert_embeddings = bert_emb_data['embeddings']
+print("Loading BioMedBERT embeddings...")
+bert_embs = bert_data['embeddings']
 
-# Create Fusion tensors
-X_train_fusion = []
-for subj in train_subjects:
-    X_train_fusion.append(np.concatenate([lstm_emb[subj], bert_embeddings[subj]]))
-X_train_fusion = torch.FloatTensor(np.array(X_train_fusion))
+# ── Build fusion embedding matrices ──────────────────────────────────────────
+print("\nBuilding fusion embedding matrices...")
 
-X_test_fusion = []
-for subj in test_subjects:
-    X_test_fusion.append(np.concatenate([lstm_emb[subj], bert_embeddings[subj]]))
-X_test_fusion = torch.FloatTensor(np.array(X_test_fusion))
+def get_fusion_embedding(subj_id):
+    """Concatenate LSTM (64) + BERT CLS (768) = 832 dims."""
+    lstm_emb = lstm_data.get(subj_id)
+    bert_entry = bert_embs.get(subj_id)
 
-# Model architecture
-class MultimodalFusion(nn.Module):
-    def __init__(self):
+    if lstm_emb is None:
+        lstm_emb = np.zeros(64, dtype=np.float32)
+    if bert_entry is None:
+        bert_emb = np.zeros(768, dtype=np.float32)
+    elif isinstance(bert_entry, dict):
+        bert_emb = bert_entry['cls_embedding'].astype(np.float32)
+    else:
+        bert_emb = np.array(bert_entry, dtype=np.float32)
+
+    return np.concatenate([
+        np.array(lstm_emb, dtype=np.float32),
+        bert_emb
+    ])
+
+# Build train embeddings
+X_train_fusion = np.stack([
+    get_fusion_embedding(sid) for sid in train_subjects
+])
+X_test_fusion = np.stack([
+    get_fusion_embedding(sid) for sid in test_subjects
+])
+
+print(f"  Fusion embedding shape: {X_train_fusion.shape}  "
+      f"(expect (N, 832))")
+assert X_train_fusion.shape[1] == 832, \
+    f"Expected 832 dims, got {X_train_fusion.shape[1]}"
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+class FusionDataset(tdata.Dataset):
+    def __init__(self, X, y):
+        # Pre-load to GPU for maximum training speed
+        self.X = torch.FloatTensor(X).to(device)
+        self.y = torch.LongTensor(y).to(device)
+    def __len__(self):        return len(self.y)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+# ── Fusion model ──────────────────────────────────────────────────────────────
+class FusionModel(nn.Module):
+    """
+    832-dim concatenated embedding → AKI prediction.
+    Mirrors paper's architecture: FC → ReLU → Dropout → FC → ReLU → Dropout → Softmax
+    """
+    def __init__(self, input_dim=832, dropout=0.3):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(832, 256),
+            nn.Linear(input_dim, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),
             nn.Linear(256, 64),
             nn.ReLU(),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),
             nn.Linear(64, 2)
         )
+
     def forward(self, x):
         return self.net(x)
 
-fusion_model = MultimodalFusion()
-optimizer = torch.optim.Adam(fusion_model.parameters(), lr=1e-3)
-criterion = nn.CrossEntropyLoss()
+# ── Training ──────────────────────────────────────────────────────────────────
+print("\n" + "="*60)
+print("Training Multimodal Fusion Model")
+print("="*60)
 
-if len(train_subjects) >= 10:
-    val_size = max(1, int(0.1 * len(train_subjects)))
-else:
-    print("WARNING: Train set too small for early stopping. Training for full 50 epochs.")
+# Class-weighted loss for imbalanced data
+n_pos = int(np.sum(y_train))
+n_neg = len(y_train) - n_pos
+pos_weight = torch.tensor([1.0, n_neg / n_pos]).to(device)
+criterion  = nn.CrossEntropyLoss(weight=pos_weight)
+print(f"  Class weight ratio: {n_neg/n_pos:.2f}x  ({n_neg} neg / {n_pos} pos)")
 
-for epoch in range(50):
-    fusion_model.train()
-    optimizer.zero_grad()
-    logits = fusion_model(X_train_fusion)
-    loss = criterion(logits, y_tr_t)
-    loss.backward()
-    optimizer.step()
+model     = FusionModel().to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3,
+                             weight_decay=1e-4)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, patience=5, factor=0.5, verbose=False
+)
 
-fusion_model_path = '../models/fusion_model.pt'
-torch.save(fusion_model.state_dict(), fusion_model_path)
-print(f"\nSaved fusion model to {fusion_model_path}")
-print(f"models/fusion_model.pt -> EXISTS: {os.path.exists(fusion_model_path)}\n")
+# Patient-level validation split (10%)
+val_n   = max(1, int(0.1 * len(train_subjects)))
+train_n = len(train_subjects) - val_n
 
-# Eval Multimodal
-fusion_model.eval()
+train_loader = tdata.DataLoader(
+    FusionDataset(X_train_fusion[:train_n], y_train[:train_n]),
+    batch_size=512,   # large batch — fusion model is tiny, GPU has headroom
+    shuffle=True
+)
+val_loader = tdata.DataLoader(
+    FusionDataset(X_train_fusion[train_n:], y_train[train_n:]),
+    batch_size=512,
+    shuffle=False
+)
+
+print(f"  Train: {train_n:,}  Val: {val_n:,}  "
+      f"batch_size=512  early_stopping patience=10")
+
+best_val_loss  = float('inf')
+patience_count = 0
+PATIENCE       = 10
+EPOCHS         = 100  # will early-stop well before this
+
+for epoch in range(EPOCHS):
+    # Train
+    model.train()
+    train_loss = 0.0
+    for xb, yb in train_loader:
+        optimizer.zero_grad()
+        logits = model(xb)
+        loss   = criterion(logits, yb)
+        loss.backward()
+        optimizer.step()
+        train_loss += loss.item()
+    train_loss /= len(train_loader)
+
+    # Validate
+    model.eval()
+    val_loss = 0.0
+    with torch.no_grad():
+        for xb, yb in val_loader:
+            val_loss += criterion(model(xb), yb).item()
+    val_loss /= len(val_loader)
+    scheduler.step(val_loss)
+
+    if (epoch + 1) % 10 == 0:
+        print(f"  Epoch {epoch+1:03d}  "
+              f"train={train_loss:.4f}  val={val_loss:.4f}")
+
+    if val_loss < best_val_loss:
+        best_val_loss  = val_loss
+        patience_count = 0
+        torch.save(model.state_dict(), '../models/fusion_model.pt')
+    else:
+        patience_count += 1
+        if patience_count >= PATIENCE:
+            print(f"  Early stopping at epoch {epoch+1}  "
+                  f"best_val_loss={best_val_loss:.4f}")
+            break
+
+# Reload best checkpoint
+model.load_state_dict(
+    torch.load('../models/fusion_model.pt',
+               map_location=device, weights_only=True)
+)
+model.eval()
+print("  Saved: models/fusion_model.pt")
+
+# ── Evaluate fusion model ─────────────────────────────────────────────────────
+print("\nEvaluating fusion model...")
+X_test_t = torch.FloatTensor(X_test_fusion).to(device)
+
 with torch.no_grad():
-    logits = fusion_model(X_test_fusion)
-    y_prob_fusion = torch.softmax(logits, dim=1)[:, 1].numpy()
-    y_pred_fusion = torch.argmax(logits, dim=1).numpy()
+    logits_test    = model(X_test_t)
+    y_prob_fusion  = torch.softmax(logits_test, dim=1)[:,1].cpu().numpy()
+    y_pred_fusion  = torch.argmax(logits_test, dim=1).cpu().numpy()
 
-# ---------------------------------------------------------
-# Re-evaluate unimodal models to build the table
-# ---------------------------------------------------------
-X_test_raw = np.random.randn(2, 6, 72)
-X_test_eng = []
-for matrix in X_test_raw:
-    flattened = matrix.flatten()
-    values = matrix[:, :36]
-    masks = matrix[:, 36:]
-    min_vals = np.min(values, axis=0)
-    max_vals = np.max(values, axis=0)
-    mean_vals = np.mean(values, axis=0)
-    std_vals = np.std(values, axis=0)
-    n = values.shape[0]
-    m3 = np.sum((values - mean_vals)**3, axis=0) / n
-    m2 = np.sum((values - mean_vals)**2, axis=0) / n
-    skew_vals = m3 / (m2**1.5 + 1e-8)
-    skew_vals = np.nan_to_num(skew_vals, 0)
-    count_observed = np.sum(masks == 0, axis=0)
-    eng = np.concatenate([min_vals, max_vals, mean_vals, std_vals, skew_vals, count_observed])
-    X_test_eng.append(np.concatenate([flattened, eng]))
-X_test_eng = np.array(X_test_eng)
+def metrics(name, y_true, y_pred, y_prob):
+    acc   = accuracy_score(y_true, y_pred)
+    prec  = precision_score(y_true, y_pred,  zero_division=0)
+    rec   = recall_score(y_true, y_pred,     zero_division=0)
+    try:
+        auc   = roc_auc_score(y_true, y_prob)
+        auprc = average_precision_score(y_true, y_prob)
+    except ValueError:
+        auc, auprc = 0.0, 0.0
+    cm = confusion_matrix(y_true, y_pred)
+    print(f"\n[{name}]")
+    print(f"  Accuracy={acc:.4f}  Precision={prec:.4f}  "
+          f"Recall={rec:.4f}  AUROC={auc:.4f}  AUPRC={auprc:.4f}")
+    print(f"  Confusion Matrix:\n{cm}")
+    return {'Model': name, 'Accuracy': round(acc,4),
+            'Precision': round(prec,4), 'Recall': round(rec,4),
+            'AUROC': round(auc,4), 'AUPRC': round(auprc,4)}
 
-with open('../models/lr_model.pkl', 'rb') as f:
-    lr = pickle.load(f)
-y_pred_lr = lr.predict(X_test_eng)
-y_prob_lr = lr.predict_proba(X_test_eng)[:, 1]
+fusion_metrics = metrics('Multimodal Fusion',
+                         y_test, y_pred_fusion, y_prob_fusion)
 
-with open('../models/xgb_model.pkl', 'rb') as f:
-    xgb = pickle.load(f)
-y_pred_xgb = xgb.predict(X_test_eng)
-y_prob_xgb = xgb.predict_proba(X_test_eng)[:, 1]
+# ── McNemar's test vs best unimodal ──────────────────────────────────────────
+print("\n" + "="*60)
+print("McNemar's Test — Fusion vs Best Unimodal (LSTM)")
+print("="*60)
+
+# Reload LSTM predictions
+import ast
+test_df_full = pd.read_csv('../output/test_cohort.csv')
+
+def parse_ts(s):
+    try:    return np.array(ast.literal_eval(s), dtype=np.float32)
+    except: return np.zeros((6,72), dtype=np.float32)
+
+X_test_raw = np.stack(test_df_full['ts_matrix'].apply(parse_ts).values)
 
 class TS_LSTM(nn.Module):
     def __init__(self):
         super().__init__()
-        self.lstm = nn.LSTM(input_size=72, hidden_size=64, batch_first=True)
+        self.lstm    = nn.LSTM(input_size=72, hidden_size=64, batch_first=True)
         self.dropout = nn.Dropout(0.3)
-        self.fc = nn.Linear(64, 2)
+        self.fc      = nn.Linear(64, 2)
     def forward(self, x):
-        out, (hn, cn) = self.lstm(x)
-        hidden = hn[-1]
-        drop = self.dropout(hidden)
-        logits = self.fc(drop)
-        return logits, hidden
+        _, (hn, _) = self.lstm(x)
+        return self.fc(self.dropout(hn[-1]))
 
-lstm = TS_LSTM()
-lstm.load_state_dict(torch.load('../models/lstm_model.pt', weights_only=True))
-lstm.eval()
+lstm_model = TS_LSTM().to(device)
+lstm_model.load_state_dict(
+    torch.load('../models/lstm_model.pt',
+               map_location=device, weights_only=True)
+)
+lstm_model.eval()
+
 with torch.no_grad():
-    logits, _ = lstm(torch.FloatTensor(X_test_raw))
-    y_prob_lstm = torch.softmax(logits, dim=1)[:, 1].numpy()
-    y_pred_lstm = torch.argmax(logits, dim=1).numpy()
+    X_t = torch.FloatTensor(X_test_raw).to(device)
+    lstm_preds = torch.argmax(lstm_model(X_t), dim=1).cpu().numpy()
 
-# BioMedBERT Mock — class must be defined here so pickle can deserialize it
-class DummyBioMedBERT:
-    def get_predictions_and_embeddings(self, note_chunks):
-        n = len(note_chunks)
-        if n == 0:
-            return 0.5, np.zeros(768)
-        probs = np.random.uniform(0.1, 0.9, size=n)
-        P_max = np.max(probs)
-        P_mean = np.mean(probs)
-        c = 2
-        P_final = (P_max + (n/c) * P_mean) / (1 + n/c)
-        embedding = np.random.randn(768)
-        return P_final, embedding
+# McNemar contingency table
+both_correct      = np.sum((y_pred_fusion == y_test) & (lstm_preds == y_test))
+fusion_only       = np.sum((y_pred_fusion == y_test) & (lstm_preds != y_test))
+lstm_only         = np.sum((y_pred_fusion != y_test) & (lstm_preds == y_test))
+both_wrong        = np.sum((y_pred_fusion != y_test) & (lstm_preds != y_test))
 
-with open('../models/biomedbert_embeddings.pkl', 'rb') as f:
-    bert_model = pickle.load(f)
-y_prob_bert = []
-y_pred_bert = []
-test_notes = [[101, 400, 102], [101, 500, 102]]
-for notes in test_notes:
-    p_final, _ = bert_model.get_predictions_and_embeddings(notes)
-    y_prob_bert.append(p_final)
-    y_pred_bert.append(1 if p_final > 0.5 else 0)
+contingency = np.array([[both_correct, fusion_only],
+                        [lstm_only,    both_wrong]])
 
-# Build Table
-results = []
-def get_metrics(name, y_true, y_pred, y_prob):
-    return {
-        'Model': name,
-        'Accuracy': accuracy_score(y_true, y_pred),
-        'Precision': precision_score(y_true, y_pred, zero_division=0),
-        'Recall': recall_score(y_true, y_pred, zero_division=0),
-        'AUROC': roc_auc_score(y_true, y_prob),
-        'AUPRC': average_precision_score(y_true, y_prob)
-    }
+# McNemar's test
+b, c = fusion_only, lstm_only
+if b + c > 0:
+    chi2_stat = (abs(b - c) - 1)**2 / (b + c)
+    from scipy.stats import chi2
+    p_value = chi2.sf(chi2_stat, df=1)
+else:
+    chi2_stat, p_value = 0.0, 1.0
 
-results.append(get_metrics('LR', y_test, y_pred_lr, y_prob_lr))
-results.append(get_metrics('XGBoost', y_test, y_pred_xgb, y_prob_xgb))
-results.append(get_metrics('LSTM', y_test, y_pred_lstm, y_prob_lstm))
-results.append(get_metrics('BioMedBERT', y_test, y_pred_bert, y_prob_bert))
-results.append(get_metrics('Multimodal', y_test, y_pred_fusion, y_prob_fusion))
+print(f"  Contingency table:")
+print(f"    Both correct:      {both_correct:,}")
+print(f"    Fusion only right: {fusion_only:,}")
+print(f"    LSTM only right:   {lstm_only:,}")
+print(f"    Both wrong:        {both_wrong:,}")
+print(f"\n  McNemar statistic: {chi2_stat:.4f}")
+print(f"  p-value:           {p_value:.4f}")
+print(f"  Significant (p<0.05): {p_value < 0.05}")
+print(f"  Paper reported p=3.7×10⁻³ for AKI")
 
-df = pd.DataFrame(results).round(3)
-df['Paper_AUROC_Ref'] = [0.832, 0.855, 0.873, 0.742, 0.888]
+# ── Final comparison table ────────────────────────────────────────────────────
+print("\n" + "="*60)
+print("FINAL FIVE-MODEL COMPARISON TABLE")
+print("="*60)
 
-print("--- FINAL COMPARISON TABLE ---")
-print(df.to_string(index=False))
+# Load previous unimodal results
+prev = pd.read_csv('../output/unimodal_results.csv')
 
-# McNemar's Test
-print("\n--- MCNEMAR'S TEST ---")
-print("Note: With N=2 test patients, the test result is statistically meaningless.")
-print("This is just verifying the code runs. The paper reported p=3.7x10^-3 for AKI.")
-# Compare Fusion vs Best Unimodal (say, LSTM based on AUROC in paper)
-c00 = sum((y_pred_fusion == y_test) & (y_pred_lstm == y_test))
-c01 = sum((y_pred_fusion == y_test) & (y_pred_lstm != y_test))
-c10 = sum((y_pred_fusion != y_test) & (y_pred_lstm == y_test))
-c11 = sum((y_pred_fusion != y_test) & (y_pred_lstm != y_test))
-table = [[c00, c01], [c10, c11]]
-result = mcnemar(table, exact=True)
-print(f"Test Statistic: {result.statistic}")
-print(f"p-value: {result.pvalue}")
+paper = {
+    'Logistic Regression': (0.832, 0.566),
+    'XGBoost':             (0.855, 0.658),
+    'LSTM':                (0.873, 0.699),
+    'BioMedBERT':          (0.742, 0.420),
+    'Multimodal Fusion':   (0.888, 0.727),
+}
 
-# SHAP Analysis — using manual gradient-based saliency (no TF dependency)
-print("\n--- SHAP ANALYSIS (LSTM Component) ---")
-print("Note: SHAP on random mock data is expected to produce arbitrary feature rankings.")
-print("Paper's top features for AKI: urine output, SpO2, diastolic BP, RBC count, weight.")
+all_results = pd.concat([
+    prev[['Model','Accuracy','Precision','Recall','AUROC','AUPRC']],
+    pd.DataFrame([fusion_metrics])
+], ignore_index=True)
+
+all_results['Paper_AUROC'] = all_results['Model'].map(
+    lambda m: paper.get(m, (None,None))[0]
+)
+all_results['Paper_AUPRC'] = all_results['Model'].map(
+    lambda m: paper.get(m, (None,None))[1]
+)
+
+print(all_results.to_string(index=False))
+
+print(f"\nKey finding: Multimodal AUROC {fusion_metrics['AUROC']:.4f} "
+      f"vs paper 0.888")
+print(f"Key finding: Multimodal AUPRC {fusion_metrics['AUPRC']:.4f} "
+      f"vs paper 0.727")
+
+multimodal_beats_lstm = fusion_metrics['AUROC'] > 0.8594
+print(f"\nMultimodal > LSTM (expected): {multimodal_beats_lstm}")
+
+all_results.to_csv('../output/fusion_results.csv', index=False)
+print("\nSaved: output/fusion_results.csv")
+
+# ── SHAP (fast — 500 patient sample only) ────────────────────────────────────
+print("\n" + "="*60)
+print("SHAP Analysis (500-patient sample for speed)")
+print("="*60)
 
 try:
-    features = [
-        'Heart Rate', 'Systolic BP', 'Diastolic BP', 'Mean BP', 'Respiratory Rate',
-        'Temperature (C)', 'SpO2', 'GCS Motor', 'GCS Verbal', 'GCS Eye', 'GCS Total',
-        'Glucose', 'BUN', 'Creatinine', 'Sodium', 'Potassium', 'Bicarbonate', 'Chloride',
-        'Anion Gap', 'Albumin', 'Lactate', 'Hemoglobin', 'Hematocrit', 'WBC', 'Neutrophils',
-        'Platelets', 'RBC', 'Phosphate', 'Magnesium', 'Calcium', 'Urine Output',
-        'Weight', 'pH', 'PaO2', 'PaCO2', 'FiO2'
-    ]
+    import shap
 
-    lstm.eval()
-    X_test_tensor = torch.FloatTensor(X_test_raw)
-    X_test_tensor.requires_grad_(True)
+    # Use 500 random patients as background and explain another 500
+    np.random.seed(42)
+    bg_idx  = np.random.choice(len(X_train_fusion), 200, replace=False)
+    exp_idx = np.random.choice(len(X_test_fusion),  500, replace=False)
 
-    # Forward pass: get class-1 logit
-    logits_shap, _ = lstm(X_test_tensor)
-    score = logits_shap[:, 1].sum()
-    score.backward()
+    bg_data  = torch.FloatTensor(X_train_fusion[bg_idx]).to(device)
+    exp_data = torch.FloatTensor(X_test_fusion[exp_idx]).to(device)
 
-    # Gradient shape: (N, 6, 72). Use abs mean over patients as attribution proxy.
-    grad = X_test_tensor.grad.detach().numpy()  # (2, 6, 72)
-    mean_abs_grad = np.mean(np.abs(grad), axis=0)  # (6, 72)
+    # Wrapper for SHAP — returns positive class probability
+    def model_predict(x):
+        model.eval()
+        with torch.no_grad():
+            t = torch.FloatTensor(x).to(device)
+            return torch.softmax(model(t), dim=1)[:,1].cpu().numpy()
 
-    shap_output = {}
-    for t in range(6):
-        timestep_grad = mean_abs_grad[t, :36]  # only clinical features, not masks
-        top_indices = np.argsort(timestep_grad)[::-1][:5]
-        top_names = [features[i] for i in top_indices]
-        shap_output[f'timestep_{t}'] = top_names
-        print(f"  Timestep {t} top 5 features: {', '.join(top_names)}")
+    explainer   = shap.KernelExplainer(model_predict,
+                                       bg_data.cpu().numpy())
+    shap_values = explainer.shap_values(exp_data.cpu().numpy(),
+                                        nsamples=100)
 
-    # Check overlap with paper's top features
-    paper_top = {'Urine Output', 'SpO2', 'Diastolic BP', 'RBC', 'Weight'}
-    all_mock_top = set(f for v in shap_output.values() for f in v)
-    overlap = paper_top.intersection(all_mock_top)
-    if overlap:
-        print(f"\n  Overlap with paper's top features on mock data: {overlap}")
-        print("  (Coincidental on random data — meaningful overlap expected only on real MIMIC-IV)")
-    else:
-        print("\n  No overlap with paper's top features. Expected: SHAP on random mock data produces arbitrary rankings.")
+    # Split SHAP values into LSTM (first 64) and BERT (next 768) components
+    lstm_shap = np.abs(shap_values[:, :64]).mean(axis=0)
+    bert_shap = np.abs(shap_values[:, 64:]).mean(axis=0)
 
-    shap_save = {'IS_MOCK_FUSION': True, 'gradient_attributions': mean_abs_grad, 'per_timestep_top5': shap_output}
+    print(f"  Mean |SHAP| for LSTM component: {lstm_shap.mean():.4f}")
+    print(f"  Mean |SHAP| for BERT component: {bert_shap.mean():.4f}")
+    dominant = "LSTM" if lstm_shap.mean() > bert_shap.mean() else "BERT"
+    print(f"  Dominant modality by SHAP:       {dominant}")
+    print(f"  (Paper found time-series features dominated early)")
+
     with open('../embeddings/shap_values.pkl', 'wb') as f:
-        pickle.dump(shap_save, f)
-    print("\n  Saved SHAP/gradient attribution values to embeddings/shap_values.pkl")
+        pickle.dump({'shap_values': shap_values,
+                     'lstm_shap':   lstm_shap,
+                     'bert_shap':   bert_shap}, f)
+    print("  Saved: embeddings/shap_values.pkl")
 
+except ImportError:
+    print("  SHAP not installed — skipping. Install with: pip install shap")
 except Exception as e:
-    print(f"  SHAP Analysis failed: {e}")
+    print(f"  SHAP skipped: {e}")
 
+# ── Final summary ─────────────────────────────────────────────────────────────
+print("\n" + "="*60)
+print("REPLICATION COMPLETE")
+print("="*60)
+print(f"""
+Results saved to:
+  output/fusion_results.csv     ← five-model comparison table
+  models/fusion_model.pt        ← trained fusion model
+  embeddings/shap_values.pkl    ← SHAP analysis
+
+IS_MOCK_BERT: {bert_data['IS_MOCK_BERT']}
+
+Next steps:
+  1. Fix BioMedBERT class weights in train_unimodal.py
+     (add pos_weight to CrossEntropyLoss)
+  2. Rerun train_unimodal.py to get real BERT AUROC
+  3. Rerun this script for final fusion results
+  4. git add output/ models/ && git commit && git push
+""")
