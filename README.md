@@ -130,7 +130,7 @@ Use the following command to extract validation set from the training set. This 
 
 ### In-hospital mortality prediction
 
-Run the following command to train the neural network which gives the best result. We got the best performance on validation set after 28 epochs.
+Run the following commandto train the neural network which gives the best result. We got the best performance on validation set after 28 epochs.
        
        python -um mimic4models.in_hospital_mortality.main --network mimic4models/keras_models/lstm.py --dim 16 --timestep 1.0 --depth 2 --dropout 0.3 --mode train --batch_size 8 --output_dir mimic4models/in_hospital_mortality
 
