@@ -17,3 +17,10 @@ embeddings/
 models/
 
 output/*.csv
+
+pipeline_scripts/data/
+output/*.csv
+models/
+embeddings/
+*.pkl
+*.pt
